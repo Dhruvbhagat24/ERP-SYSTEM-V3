@@ -4,6 +4,12 @@ const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const pool = require('./db');
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('Missing JWT_SECRET environment variable');
+}
+
 const stocksRouter = express.Router();
 
 const app = express();
@@ -22,25 +28,46 @@ app.use((req,res,next)=>{
 });
 
 /* ---------------- Auth / JWT ---------------- */
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey';
-
-const verifyToken = async (req,res,next)=>{
+const verifyToken = async (req, res, next) => {
   try {
-    const token = req.headers.authorization?.split(' ')[1];
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'No token provided' });
-    const decoded = jwt.verify(token, JWT_SECRET);
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (jwtErr) {
+      console.error('JWT verify error:', jwtErr);
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    // fetch user from DB (keeps canonical DB values)
     const userRes = await pool.query(
       'SELECT id,name,email,role,company_id FROM users WHERE id=$1',
       [decoded.id]
     );
-    if (!userRes.rows.length) return res.status(401).json({ error: 'Invalid token' });
-    req.user = userRes.rows[0];
+    if (!userRes.rows.length) return res.status(401).json({ error: 'Invalid token (user not found)' });
+
+    const dbUser = userRes.rows[0];
+
+    // Ensure company_id exists on req.user: prefer DB value, fallback to token.companyId or token.company_id
+    const companyIdFromToken = decoded.companyId ?? decoded.company_id ?? null;
+    req.user = {
+      ...dbUser,
+      // keep DB company_id if present; else use token value
+      company_id: dbUser.company_id || companyIdFromToken,
+      // also keep raw token claims if you need them for debugging
+      _tokenClaims: decoded
+    };
+
     next();
-  } catch(e){
-    console.error('JWT error:', e.message);
+  } catch (e) {
+    console.error('verifyToken error:', e);
     return res.status(401).json({ error: 'Unauthorized' });
   }
 };
+
 
 /* ---------------- Helpers ---------------- */
 const q = async (res, sql, params=[], single=false)=>{
@@ -52,7 +79,23 @@ const q = async (res, sql, params=[], single=false)=>{
     res.status(500).json({ error: 'Internal server error' });
   }
 };
-const num = v => v==='' || v==null ? null : Number(v);
+// Replace old num with safe numeric coercion
+const num = (v) => {
+  if (v === '' || v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null; // avoid NaN -> DB errors
+};
+
+// Add a helper to normalize dates (supports dd-mm-yyyy)
+const dateOrNull = (v) => {
+  if (!v) return null;
+  if (typeof v === 'string' && /^\d{2}-\d{2}-\d{4}$/.test(v)) {
+    const [dd, mm, yyyy] = v.split('-');
+    return `${yyyy}-${mm}-${dd}`; // ISO yyyy-mm-dd
+  }
+  const d = new Date(v);
+  return isNaN(d) ? null : d.toISOString().slice(0, 10);
+};
 
 /* ---------------- Auth Routes ---------------- */
 app.post('/api/auth/login', async (req,res)=>{
@@ -92,6 +135,115 @@ app.post('/api/auth/login', async (req,res)=>{
 });
 
 app.get('/api/auth/me', verifyToken, (req,res)=> res.json({ user: req.user }));
+
+// Add the missing company registration route
+app.post('/api/auth/register-company', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const {
+      companyName,
+      industry,
+      email,
+      phone,
+      address,
+      adminName,
+      adminEmail,
+      password
+    } = req.body;
+
+    // Validate required fields
+    if (!companyName || !industry || !email || !phone || !address || !adminName || !adminEmail || !password) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    // Check if company already exists
+    const existingCompany = await pool.query(
+      'SELECT id FROM companies WHERE LOWER(name) = LOWER($1) OR LOWER(email) = LOWER($2)',
+      [companyName.trim(), email.trim()]
+    );
+
+    if (existingCompany.rows.length > 0) {
+      return res.status(400).json({ error: 'Company with this name or email already exists' });
+    }
+
+    // Check if admin email already exists
+    const existingUser = await pool.query(
+      'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
+      [adminEmail.trim()]
+    );
+
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ error: 'Admin email already registered' });
+    }
+
+    await client.query('BEGIN');
+
+    // Create company
+    const companyResult = await client.query(
+      `INSERT INTO companies (name, industry, email, phone, address, currency, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+       RETURNING id, name, industry, email, phone, address, currency`,
+      [companyName.trim(), industry, email.trim(), phone.trim(), address.trim(), 'USD']
+    );
+
+    const company = companyResult.rows[0];
+
+    // Hash admin password
+    const hashedPassword = await bcrypt.hash(password.trim(), 10);
+
+    // Create admin user
+    const userResult = await client.query(
+      `INSERT INTO users (company_id, name, email, password, role, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+       RETURNING id, name, email, role, company_id`,
+      [company.id, adminName.trim(), adminEmail.trim(), hashedPassword, 'admin']
+    );
+
+    const user = userResult.rows[0];
+
+    await client.query('COMMIT');
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { id: user.id, companyId: company.id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+
+    res.status(201).json({
+      message: 'Company registered successfully',
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        company_id: company.id
+      },
+      company: {
+        id: company.id,
+        name: company.name,
+        industry: company.industry,
+        email: company.email,
+        phone: company.phone,
+        address: company.address,
+        currency: company.currency
+      }
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Company registration error:', error);
+    
+    if (error.code === '23505') { // Unique constraint violation
+      return res.status(400).json({ error: 'Company name or email already exists' });
+    }
+    
+    res.status(500).json({ error: 'Failed to register company. Please try again.' });
+  } finally {
+    client.release();
+  }
+});
 
 /* ------------------------------------------------------------------
    SELLING MODULE
@@ -497,9 +649,9 @@ assets.post('/', verifyToken, async (req, res) => {
         company_id,
         asset_code,
         name,
-        category_id || null,
+        num(category_id), // safe numeric
         description || null,
-        purchase_date || null,
+        dateOrNull(purchase_date),
         num(purchase_cost),
         num(current_value),
         depreciation_method || null,
@@ -509,18 +661,17 @@ assets.post('/', verifyToken, async (req, res) => {
         condition_status || null,
         assigned_to || null,
         serial_number || null,
-        warranty_expiry || null,
-        maintenance_due_date || null,
+        dateOrNull(warranty_expiry),
+        dateOrNull(maintenance_due_date),
         status,
         notes || null
       ],
       true
     );
   } catch (e) {
-    // Log full error for debugging, return a friendly message
-    console.error('Create asset:', e);
-    // If postgres gives duplicate key on asset_code, you may want to retry generation — handle that if it occurs.
-    res.status(500).json({ error: 'Failed to create asset' });
+    console.error('Create asset error (full):', e);
+    const detail = e?.detail || e?.message || String(e);
+    return res.status(500).json({ error: 'Failed to create asset', detail });
   }
 });
 
@@ -546,9 +697,9 @@ assets.put('/:id', verifyToken, async (req, res) => {
     [
       asset_code || null,
       name,
-      category_id || null,
+      num(category_id), 
       description || null,
-      purchase_date || null,
+      dateOrNull(purchase_date),
       num(purchase_cost),
       num(current_value),
       depreciation_method || null,
@@ -558,8 +709,8 @@ assets.put('/:id', verifyToken, async (req, res) => {
       condition_status || null,
       assigned_to || null,
       serial_number || null,
-      warranty_expiry || null,
-      maintenance_due_date || null,
+      dateOrNull(warranty_expiry),
+      dateOrNull(maintenance_due_date),
       status,
       notes || null,
       req.params.id
@@ -580,10 +731,6 @@ assets.delete('/:id', verifyToken, async (req, res) => {
 
 module.exports = assets;
 
-
-/* ------------------------------------------------------------------
-   STOCKS (basic – adjust if you have richer schema)
-------------------------------------------------------------------- */
 app.get('/api/stocks', async (_ ,res)=>{
   await q(res,'SELECT * FROM stocks ORDER BY created_at DESC');
 });
@@ -670,12 +817,6 @@ app.use('/api/stocks', stocksRouter);
 // accounting router - place this near your other routers (selling/buying/assets)
 const accounting = express.Router();
 
-/*
-  Table: accounting_entries
-  Columns (as you have):
-    id, company_id, type, amount, description, account_name, reference_number, created_at, updated_at
-*/
-
 // GET /api/accounting/:companyId  - returns array of entries for a company
 accounting.get('/:companyId', verifyToken, async (req, res) => {
   try {
@@ -699,7 +840,7 @@ accounting.get('/:companyId', verifyToken, async (req, res) => {
   }
 });
 
-// POST /api/accounting  - create entry (body may include company_id or uses token)
+// POST /api/accounting  
 accounting.post('/', verifyToken, async (req, res) => {
   try {
     const authCompany = req.user?.company_id;
@@ -727,7 +868,7 @@ accounting.post('/', verifyToken, async (req, res) => {
   }
 });
 
-// PUT /api/accounting/entries/:id  - update entry (must belong to same company)
+// PUT /api/accounting/entries/:id  
 accounting.put('/entries/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -769,10 +910,7 @@ accounting.delete('/entries/:id', verifyToken, async (req, res) => {
 // Mount router
 app.use('/api/accounting', accounting);
 
-
-/* ------------------------------------------------------------------
-   ANALYTICS (live, no static data)
-------------------------------------------------------------------- */
+/* ---------------- Analytics Routes ---------------- */
 app.get('/api/analytics/buying', async (_ ,res)=>{
   await q(res,
     `SELECT id,po_number,order_date,status,total_amount,created_at
